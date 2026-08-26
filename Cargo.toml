@@ -1,0 +1,8 @@
+[package]
+name = "playlist-tidy"
+version = "0.1.0"
+edition = "2021"
+description = "Normalizes messy M3U playlist files into strict, well-formed ones"
+license = "MIT"
+
+[dependencies]
