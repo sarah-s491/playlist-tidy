@@ -15,6 +15,12 @@ default - it tells you exactly what's wrong and where, so you can decide
 whether the source file is worth fixing. Pass `--lenient` when you'd rather
 have it repair what it can and just tell you what it changed.
 
+It also reads PLS playlists (the `[playlist]` / `FileN=` / `TitleN=` /
+`LengthN=` format some older rippers and Winamp-derived tools export) and
+converts them to the same normalized M3U output. Format is picked from the
+file extension, or by sniffing for a `[playlist]` header when reading from
+stdin. Output is always M3U - there's no round-tripping back to PLS.
+
 ## Usage
 
 Strict mode (default) rejects anything that isn't well-formed:
@@ -83,9 +89,9 @@ cargo build --release
 
 ## Status
 
-Early. Handles single M3U/M3U8 files passed as a path or via stdin. Not yet
-handled: PLS/XSPF formats, batch processing a directory, verifying that
-referenced files actually exist on disk.
+Early. Handles single M3U/M3U8/PLS files passed as a path or via stdin. Not
+yet handled: XSPF input, a `--check` mode, batch processing a directory,
+verifying that referenced files actually exist on disk.
 
 ## License
 

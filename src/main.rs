@@ -4,9 +4,12 @@ use std::process::ExitCode;
 fn print_usage() {
     eprintln!("usage: playlist-tidy [--lenient] [-o OUTPUT] <INPUT|->");
     eprintln!();
-    eprintln!("  INPUT        path to an .m3u/.m3u8 file, or - to read stdin");
+    eprintln!("  INPUT        path to an .m3u/.m3u8/.pls file, or - to read stdin");
     eprintln!("  -o, --output write the result here instead of stdout");
     eprintln!("  --lenient    repair problems instead of rejecting the file");
+    eprintln!();
+    eprintln!("Input format is picked from the file extension, or from the");
+    eprintln!("content itself when reading stdin. Output is always M3U.");
 }
 
 fn main() -> ExitCode {
@@ -66,7 +69,11 @@ fn main() -> ExitCode {
     };
 
     let opts = playlist_tidy::Options { lenient };
-    match playlist_tidy::format(&raw, &opts) {
+    let result = match playlist_tidy::detect_input_format(&input_path, &raw) {
+        playlist_tidy::InputFormat::M3u => playlist_tidy::format(&raw, &opts),
+        playlist_tidy::InputFormat::Pls => playlist_tidy::format_pls(&raw, &opts),
+    };
+    match result {
         Ok(result) => {
             for warning in &result.warnings {
                 eprintln!("warning: {}", warning);
