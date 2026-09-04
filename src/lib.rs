@@ -222,16 +222,21 @@ fn derive_title(path: &str) -> String {
 pub enum InputFormat {
     M3u,
     Pls,
+    Xspf,
 }
 
 /// Picks a format from the file extension, falling back to sniffing the
 /// first non-blank line for stdin or extensionless paths. PLS's only
-/// reliable signature is the `[playlist]` section header; everything else
-/// is assumed to be M3U, since that's already the tolerant default.
+/// reliable signature is the `[playlist]` section header, XSPF's is an XML
+/// declaration or a `<playlist` root tag; everything else is assumed to be
+/// M3U, since that's already the tolerant default.
 pub fn detect_input_format(path: &str, content: &str) -> InputFormat {
     let lower = path.to_ascii_lowercase();
     if lower.ends_with(".pls") {
         return InputFormat::Pls;
+    }
+    if lower.ends_with(".xspf") {
+        return InputFormat::Xspf;
     }
     if lower.ends_with(".m3u") || lower.ends_with(".m3u8") {
         return InputFormat::M3u;
@@ -239,6 +244,11 @@ pub fn detect_input_format(path: &str, content: &str) -> InputFormat {
     let sniffed = normalize_line_endings(strip_bom(content));
     match sniffed.lines().map(|l| l.trim()).find(|l| !l.is_empty()) {
         Some(first) if first.eq_ignore_ascii_case("[playlist]") => InputFormat::Pls,
+        Some(first)
+            if first.starts_with("<?xml") || first.to_ascii_lowercase().starts_with("<playlist") =>
+        {
+            InputFormat::Xspf
+        }
         _ => InputFormat::M3u,
     }
 }
@@ -438,6 +448,242 @@ pub fn format_pls(input: &str, opts: &Options) -> Result<FormatResult, FormatErr
     Ok(FormatResult { output: out, warnings })
 }
 
+/// Normalizes an XSPF (XML Shareable Playlist Format) playlist into the same
+/// strict M3U output `format` produces. XSPF is XML, but pulling in a real
+/// XML parser would break the no-dependencies rule, so this scans by hand
+/// for the handful of elements a playlist actually uses.
+pub fn format_xspf(input: &str, opts: &Options) -> Result<FormatResult, FormatError> {
+    let mut warnings = Vec::new();
+    let document = strip_xml_comments(strip_bom(input));
+
+    let track_list_body;
+    match find_element_body(&document, "trackList") {
+        Some(body) => track_list_body = body,
+        None => {
+            let msg = "XSPF file is missing a <trackList> element".to_string();
+            if opts.lenient {
+                warnings.push(
+                    "missing <trackList> element, scanning the whole document for tracks"
+                        .to_string(),
+                );
+                track_list_body = document.as_str();
+            } else {
+                return Err(FormatError { message: msg });
+            }
+        }
+    }
+
+    let tracks = find_element_bodies(track_list_body, "track");
+    if tracks.is_empty() {
+        return Err(FormatError {
+            message: "XSPF file has no <track> entries".to_string(),
+        });
+    }
+
+    let mut out = String::from("#EXTM3U\n");
+    for (i, track_body) in tracks.iter().enumerate() {
+        let n = i + 1;
+
+        let location = match find_element_body(track_body, "location") {
+            Some(loc) if !loc.trim().is_empty() => decode_entities(loc.trim()),
+            _ => {
+                let msg = format!("track {} has no <location> element", n);
+                if opts.lenient {
+                    warnings.push(msg);
+                    continue;
+                } else {
+                    return Err(FormatError { message: msg });
+                }
+            }
+        };
+        let raw_path = strip_file_uri(&location);
+
+        let path = match normalize_path(&raw_path) {
+            Ok(p) => p,
+            Err(reason) => {
+                if opts.lenient {
+                    warnings.push(format!("repaired path for track {} ({})", n, reason));
+                    raw_path.replace('\\', "/")
+                } else {
+                    return Err(FormatError {
+                        message: format!("invalid path for track {}: {}", n, reason),
+                    });
+                }
+            }
+        };
+
+        let title = match find_element_body(track_body, "title") {
+            Some(t) if !t.trim().is_empty() => decode_entities(t.trim()),
+            _ => derive_title(&path),
+        };
+
+        let duration = match find_element_body(track_body, "duration") {
+            Some(d) if !d.trim().is_empty() => match d.trim().parse::<i64>() {
+                Ok(ms) if ms >= 0 => ms / 1000,
+                _ => {
+                    let msg = format!(
+                        "track {} has a non-numeric or negative <duration> ({})",
+                        n,
+                        d.trim()
+                    );
+                    if opts.lenient {
+                        warnings.push(msg);
+                        -1
+                    } else {
+                        return Err(FormatError { message: msg });
+                    }
+                }
+            },
+            // XSPF's <duration> is optional, unlike PLS's LengthN; -1 (unknown) is a
+            // faithful reading of the spec, not a repair, so it needs no warning.
+            _ => -1,
+        };
+
+        out.push_str(&format!("#EXTINF:{},{}\n", duration, title));
+        out.push_str(&path);
+        out.push('\n');
+    }
+
+    Ok(FormatResult { output: out, warnings })
+}
+
+fn strip_xml_comments(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("-->") {
+            Some(end) => rest = &rest[start + end + 3..],
+            None => return out, // unterminated comment: drop the remainder
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn tag_boundary_ok(doc: &str, pos: usize) -> bool {
+    match doc.as_bytes().get(pos) {
+        None | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r') | Some(b'>') | Some(b'/') => {
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Returns the inner text of every top-level `<tag>...</tag>` (or
+/// self-closing `<tag/>`, which yields an empty body) found in `doc`.
+/// Good enough for XSPF's shallow, non-recursive `track` elements; not a
+/// general XML parser.
+fn find_element_bodies<'a>(doc: &'a str, tag: &str) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let open_needle = format!("<{}", tag);
+    let close_needle = format!("</{}>", tag);
+    let mut pos = 0;
+
+    while let Some(rel) = doc[pos..].find(&open_needle) {
+        let open_start = pos + rel;
+        let after_needle = open_start + open_needle.len();
+        if !tag_boundary_ok(doc, after_needle) {
+            pos = after_needle;
+            continue;
+        }
+
+        let Some(gt_rel) = doc[after_needle..].find('>') else {
+            break; // unterminated opening tag
+        };
+        let gt = after_needle + gt_rel;
+
+        if gt > 0 && doc.as_bytes()[gt - 1] == b'/' {
+            out.push(&doc[gt..gt]);
+            pos = gt + 1;
+            continue;
+        }
+
+        let body_start = gt + 1;
+        match doc[body_start..].find(&close_needle) {
+            Some(close_rel) => {
+                let body_end = body_start + close_rel;
+                out.push(&doc[body_start..body_end]);
+                pos = body_end + close_needle.len();
+            }
+            None => break, // unterminated element
+        }
+    }
+
+    out
+}
+
+fn find_element_body<'a>(doc: &'a str, tag: &str) -> Option<&'a str> {
+    find_element_bodies(doc, tag).into_iter().next()
+}
+
+/// Decodes the five predefined XML entities plus numeric character
+/// references (`&#65;`, `&#x41;`). Unrecognized entities are left as-is.
+fn decode_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < s.len() {
+        if bytes[i] == b'&' {
+            if let Some(semi_rel) = s[i..].find(';') {
+                let semi = i + semi_rel;
+                let entity = &s[i + 1..semi];
+                let replacement = match entity {
+                    "amp" => Some('&'),
+                    "lt" => Some('<'),
+                    "gt" => Some('>'),
+                    "quot" => Some('"'),
+                    "apos" => Some('\''),
+                    _ if entity.starts_with("#x") || entity.starts_with("#X") => {
+                        u32::from_str_radix(&entity[2..], 16).ok().and_then(char::from_u32)
+                    }
+                    _ if entity.starts_with('#') => {
+                        entity[1..].parse::<u32>().ok().and_then(char::from_u32)
+                    }
+                    _ => None,
+                };
+                if let Some(c) = replacement {
+                    out.push(c);
+                    i = semi + 1;
+                    continue;
+                }
+            }
+        }
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
+/// Strips a `file://` prefix and percent-decodes what's left, since XSPF
+/// requires `location` to be a URI even for plain local paths. Other schemes
+/// (`http://`, etc.) are left untouched for `normalize_path` to pass through.
+fn strip_file_uri(location: &str) -> String {
+    match location.strip_prefix("file://") {
+        Some(rest) => percent_decode(rest),
+        None => location.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,5 +819,112 @@ mod tests {
         let a_pos = result.output.find("a.mp3").unwrap();
         let b_pos = result.output.find("b.mp3").unwrap();
         assert!(a_pos < b_pos);
+    }
+
+    #[test]
+    fn xspf_passes_through_a_clean_playlist() {
+        let input = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+            <playlist version=\"1\" xmlns=\"http://xspf.org/ns/0/\">\n\
+            <trackList>\n\
+            <track><location>songs/track.mp3</location><title>Artist - Title</title>\
+            <duration>123000</duration></track>\n\
+            </trackList>\n\
+            </playlist>\n";
+        let result = format_xspf(input, &strict()).unwrap();
+        assert_eq!(
+            result.output,
+            "#EXTM3U\n#EXTINF:123,Artist - Title\nsongs/track.mp3\n"
+        );
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn xspf_strict_rejects_missing_tracklist() {
+        let input = "<?xml version=\"1.0\"?><playlist><track><location>a.mp3</location></track></playlist>";
+        assert!(format_xspf(input, &strict()).is_err());
+    }
+
+    #[test]
+    fn xspf_lenient_scans_document_without_tracklist() {
+        let input = "<?xml version=\"1.0\"?><playlist><track><location>a.mp3</location></track></playlist>";
+        let result = format_xspf(input, &lenient()).unwrap();
+        assert!(result.output.contains("a.mp3"));
+        assert!(!result.warnings.is_empty());
+    }
+
+    #[test]
+    fn xspf_strict_rejects_missing_location() {
+        let input = "<playlist><trackList><track><title>No file</title></track></trackList></playlist>";
+        assert!(format_xspf(input, &strict()).is_err());
+    }
+
+    #[test]
+    fn xspf_lenient_skips_track_without_location() {
+        let input = "<playlist><trackList>\
+            <track><title>No file</title></track>\
+            <track><location>b.mp3</location></track>\
+            </trackList></playlist>";
+        let result = format_xspf(input, &lenient()).unwrap();
+        assert!(!result.output.contains("No file"));
+        assert!(result.output.contains("b.mp3"));
+    }
+
+    #[test]
+    fn xspf_missing_duration_defaults_to_unknown_without_warning() {
+        let input = "<playlist><trackList><track><location>a.mp3</location></track></trackList></playlist>";
+        let result = format_xspf(input, &strict()).unwrap();
+        assert!(result.output.contains("#EXTINF:-1,a.mp3"));
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn xspf_converts_milliseconds_to_seconds() {
+        let input = "<playlist><trackList><track><location>a.mp3</location><duration>65000</duration></track></trackList></playlist>";
+        let result = format_xspf(input, &strict()).unwrap();
+        assert!(result.output.contains("#EXTINF:65,"));
+    }
+
+    #[test]
+    fn xspf_strict_rejects_non_numeric_duration() {
+        let input = "<playlist><trackList><track><location>a.mp3</location><duration>long</duration></track></trackList></playlist>";
+        assert!(format_xspf(input, &strict()).is_err());
+    }
+
+    #[test]
+    fn xspf_decodes_entities_and_strips_file_uri() {
+        let input = "<playlist><trackList><track>\
+            <location>file:///music/AC%26DC/track.mp3</location>\
+            <title>Rock &amp; Roll</title>\
+            </track></trackList></playlist>";
+        let result = format_xspf(input, &strict()).unwrap();
+        assert!(result.output.contains("Rock & Roll"));
+        assert!(result.output.contains("/music/AC&DC/track.mp3"));
+    }
+
+    #[test]
+    fn xspf_lenient_converts_backslash_paths() {
+        let input = "<playlist><trackList><track><location>C:\\Music\\track.mp3</location></track></trackList></playlist>";
+        let result = format_xspf(input, &lenient()).unwrap();
+        assert!(result.output.contains("C:/Music/track.mp3"));
+    }
+
+    #[test]
+    fn xspf_derives_title_when_missing() {
+        let input = "<playlist><trackList><track><location>songs/track.mp3</location></track></trackList></playlist>";
+        let result = format_xspf(input, &strict()).unwrap();
+        assert!(result.output.contains("#EXTINF:-1,track.mp3"));
+    }
+
+    #[test]
+    fn detects_xspf_from_extension_and_content() {
+        assert_eq!(detect_input_format("mix.xspf", ""), InputFormat::Xspf);
+        assert_eq!(
+            detect_input_format("-", "<?xml version=\"1.0\"?>\n<playlist></playlist>"),
+            InputFormat::Xspf
+        );
+        assert_eq!(
+            detect_input_format("-", "<playlist xmlns=\"http://xspf.org/ns/0/\">"),
+            InputFormat::Xspf
+        );
     }
 }
