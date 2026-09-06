@@ -2,11 +2,12 @@ use std::io::Read;
 use std::process::ExitCode;
 
 fn print_usage() {
-    eprintln!("usage: playlist-tidy [--lenient] [-o OUTPUT] <INPUT|->");
+    eprintln!("usage: playlist-tidy [--lenient] [--check] [-o OUTPUT] <INPUT|->");
     eprintln!();
     eprintln!("  INPUT        path to an .m3u/.m3u8/.pls/.xspf file, or - to read stdin");
     eprintln!("  -o, --output write the result here instead of stdout");
     eprintln!("  --lenient    repair problems instead of rejecting the file");
+    eprintln!("  --check      report whether the file needs repair; write nothing");
     eprintln!();
     eprintln!("Input format is picked from the file extension, or from the");
     eprintln!("content itself when reading stdin. Output is always M3U.");
@@ -16,6 +17,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
 
     let mut lenient = false;
+    let mut check = false;
     let mut input_path: Option<String> = None;
     let mut output_path: Option<String> = None;
 
@@ -23,6 +25,7 @@ fn main() -> ExitCode {
     while i < args.len() {
         match args[i].as_str() {
             "--lenient" => lenient = true,
+            "--check" => check = true,
             "-o" | "--output" => {
                 i += 1;
                 match args.get(i) {
@@ -51,6 +54,11 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
 
+    if check && output_path.is_some() {
+        eprintln!("error: --check cannot be combined with -o/--output");
+        return ExitCode::from(2);
+    }
+
     let raw = if input_path == "-" {
         let mut buf = String::new();
         if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
@@ -78,6 +86,13 @@ fn main() -> ExitCode {
         Ok(result) => {
             for warning in &result.warnings {
                 eprintln!("warning: {}", warning);
+            }
+            if check {
+                if result.warnings.is_empty() {
+                    return ExitCode::SUCCESS;
+                }
+                eprintln!("playlist needs repair; rerun without --check to write the result");
+                return ExitCode::from(1);
             }
             match output_path {
                 Some(path) => {

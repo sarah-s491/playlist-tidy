@@ -48,6 +48,22 @@ Read from stdin and write to a file:
 $ cat exported.m3u8 | playlist-tidy --lenient -o clean.m3u -
 ```
 
+`--check` reports whether a file needs repair without writing anything
+anywhere - useful in a script that walks a library and flags playlists worth
+fixing:
+
+```
+$ playlist-tidy --check --lenient my_mix.m3u
+warning: repaired path at line 9 (path uses backslashes instead of forward slashes)
+playlist needs repair; rerun without --check to write the result
+$ echo $?
+1
+```
+
+A clean file (or, in strict mode, one with no errors) exits 0 and prints
+nothing. `--check` can't be combined with `-o`, since it never produces
+output to write.
+
 Given this input:
 
 ```
@@ -93,8 +109,8 @@ cargo build --release
 ## Status
 
 Early. Handles single M3U/M3U8/PLS/XSPF files passed as a path or via stdin.
-Not yet handled: a `--check` mode, batch processing a directory, verifying
-that referenced files actually exist on disk.
+Not yet handled: batch processing a directory, verifying that referenced
+files actually exist on disk.
 
 ## License
 
