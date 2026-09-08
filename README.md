@@ -64,6 +64,34 @@ A clean file (or, in strict mode, one with no errors) exits 0 and prints
 nothing. `--check` can't be combined with `-o`, since it never produces
 output to write.
 
+## Batch mode
+
+Pass a directory instead of a file and every `.m3u`/`.m3u8`/`.pls`/`.xspf`
+file under it (searched recursively) gets processed the same way a single
+file would, one at a time. `-o` becomes the output directory - the input's
+subdirectory layout is mirrored underneath it, with each file's extension
+changed to `.m3u`:
+
+```
+$ playlist-tidy --lenient -o clean_library/ my_library/
+warning: old/mix.pls: repaired path for entry 3 (path uses backslashes instead of forward slashes)
+processed 14 files: 12 clean, 2 repaired, 0 failed
+```
+
+`-o` is required unless `--check` is given, since there's nowhere sensible
+for multiple files' output to go otherwise. In strict mode a file that fails
+is reported and counted, but doesn't stop the rest of the batch from being
+processed. The exit code is nonzero if any file failed, or (under `--check`)
+if any file needed repair.
+
+```
+$ playlist-tidy --check --lenient my_library/
+warning: old/mix.pls: repaired path for entry 3 (path uses backslashes instead of forward slashes)
+processed 14 files: 12 clean, 2 repaired, 0 failed
+$ echo $?
+1
+```
+
 Given this input:
 
 ```
@@ -108,9 +136,10 @@ cargo build --release
 
 ## Status
 
-Early. Handles single M3U/M3U8/PLS/XSPF files passed as a path or via stdin.
-Not yet handled: batch processing a directory, verifying that referenced
-files actually exist on disk.
+Early. Handles single M3U/M3U8/PLS/XSPF files passed as a path or via stdin,
+or a whole directory of them at once. Not yet handled: verifying that
+referenced files actually exist on disk, rewriting relative paths when a
+playlist moves.
 
 ## License
 
