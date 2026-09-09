@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn print_usage() {
-    eprintln!("usage: playlist-tidy [--lenient] [--check] [-o OUTPUT] <INPUT|DIR|->");
+    eprintln!("usage: playlist-tidy [--lenient] [--check] [--verify] [-o OUTPUT] <INPUT|DIR|->");
     eprintln!();
     eprintln!("  INPUT        path to an .m3u/.m3u8/.pls/.xspf file, or - to read stdin");
     eprintln!("  DIR          a directory to scan recursively for playlist files");
@@ -12,9 +12,30 @@ fn print_usage() {
     eprintln!("               unless --check is also given)");
     eprintln!("  --lenient    repair problems instead of rejecting the file");
     eprintln!("  --check      report whether the file(s) need repair; write nothing");
+    eprintln!("  --verify     check that every referenced local file exists on");
+    eprintln!("               disk, resolved relative to the playlist's own");
+    eprintln!("               directory; exits nonzero if any are missing");
     eprintln!();
     eprintln!("Input format is picked from the file extension, or from the");
     eprintln!("content itself when reading stdin. Output is always M3U.");
+}
+
+/// Local (non-URL) path lines from a normalized playlist. Directive lines
+/// (`#EXTM3U`, `#EXTINF:...`) never start a path, so filtering on '#' is
+/// enough without re-parsing the whole entry structure.
+fn entry_paths(output: &str) -> impl Iterator<Item = &str> {
+    output.lines().filter(|l| !l.is_empty() && !l.starts_with('#') && !l.contains("://"))
+}
+
+/// Returns every referenced local path that doesn't exist on disk, resolved
+/// relative to `base_dir` - the directory the playlist file itself lives in,
+/// since that's what a player resolves relative entries against, not the
+/// process's current directory.
+fn find_missing_files(output: &str, base_dir: &Path) -> Vec<String> {
+    entry_paths(output)
+        .filter(|path| !base_dir.join(path).exists())
+        .map(|path| path.to_string())
+        .collect()
 }
 
 fn is_playlist_extension(path: &Path) -> bool {
@@ -70,6 +91,7 @@ fn run_batch(
     dir: &str,
     opts: &playlist_tidy::Options,
     check: bool,
+    verify: bool,
     output_dir: Option<&str>,
 ) -> ExitCode {
     let mut files = Vec::new();
@@ -91,6 +113,7 @@ fn run_batch(
     let mut clean = 0;
     let mut repaired = 0;
     let mut failed = 0;
+    let mut with_missing_files = 0;
 
     for relative in &files {
         let full_path = Path::new(dir).join(relative);
@@ -116,6 +139,17 @@ fn run_batch(
 
         for warning in &result.warnings {
             eprintln!("warning: {}: {}", display, warning);
+        }
+
+        if verify {
+            let base_dir = full_path.parent().unwrap_or_else(|| Path::new(dir));
+            let missing = find_missing_files(&result.output, base_dir);
+            if !missing.is_empty() {
+                with_missing_files += 1;
+                for path in &missing {
+                    eprintln!("warning: {}: referenced file does not exist: {}", display, path);
+                }
+            }
         }
 
         if check {
@@ -154,7 +188,7 @@ fn run_batch(
         }
     }
 
-    eprintln!(
+    eprint!(
         "processed {} file{}: {} clean, {} repaired, {} failed",
         files.len(),
         if files.len() == 1 { "" } else { "s" },
@@ -162,10 +196,14 @@ fn run_batch(
         repaired,
         failed
     );
+    if verify {
+        eprint!(", {} with missing files", with_missing_files);
+    }
+    eprintln!();
 
     if failed > 0 {
         ExitCode::FAILURE
-    } else if check && repaired > 0 {
+    } else if (check && repaired > 0) || with_missing_files > 0 {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
@@ -177,6 +215,7 @@ fn main() -> ExitCode {
 
     let mut lenient = false;
     let mut check = false;
+    let mut verify = false;
     let mut input_path: Option<String> = None;
     let mut output_path: Option<String> = None;
 
@@ -185,6 +224,7 @@ fn main() -> ExitCode {
         match args[i].as_str() {
             "--lenient" => lenient = true,
             "--check" => check = true,
+            "--verify" => verify = true,
             "-o" | "--output" => {
                 i += 1;
                 match args.get(i) {
@@ -220,7 +260,7 @@ fn main() -> ExitCode {
 
     if input_path != "-" && std::fs::metadata(&input_path).map(|m| m.is_dir()).unwrap_or(false) {
         let opts = playlist_tidy::Options { lenient };
-        return run_batch(&input_path, &opts, check, output_path.as_deref());
+        return run_batch(&input_path, &opts, check, verify, output_path.as_deref());
     }
 
     let raw = if input_path == "-" {
@@ -247,11 +287,31 @@ fn main() -> ExitCode {
             for warning in &result.warnings {
                 eprintln!("warning: {}", warning);
             }
+
+            let missing = if verify {
+                let base_dir = if input_path == "-" {
+                    PathBuf::from(".")
+                } else {
+                    Path::new(&input_path)
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| PathBuf::from("."))
+                };
+                find_missing_files(&result.output, &base_dir)
+            } else {
+                Vec::new()
+            };
+            for path in &missing {
+                eprintln!("warning: referenced file does not exist: {}", path);
+            }
+
             if check {
-                if result.warnings.is_empty() {
+                if result.warnings.is_empty() && missing.is_empty() {
                     return ExitCode::SUCCESS;
                 }
-                eprintln!("playlist needs repair; rerun without --check to write the result");
+                if !result.warnings.is_empty() {
+                    eprintln!("playlist needs repair; rerun without --check to write the result");
+                }
                 return ExitCode::from(1);
             }
             match output_path {
@@ -262,6 +322,9 @@ fn main() -> ExitCode {
                     }
                 }
                 None => print!("{}", result.output),
+            }
+            if !missing.is_empty() {
+                return ExitCode::from(1);
             }
             ExitCode::SUCCESS
         }

@@ -64,6 +64,24 @@ A clean file (or, in strict mode, one with no errors) exits 0 and prints
 nothing. `--check` can't be combined with `-o`, since it never produces
 output to write.
 
+## Verifying referenced files exist
+
+`--verify` checks that every local path in the normalized output points at a
+file that actually exists, resolved relative to the playlist's own directory
+(not the current working directory) - URLs are skipped. It combines with
+either normal or `--check` runs, and exits nonzero if anything is missing:
+
+```
+$ playlist-tidy --verify my_mix.m3u
+warning: referenced file does not exist: songs/track_that_moved.mp3
+$ echo $?
+1
+```
+
+This only checks presence, not that the file is playable, and it never
+touches the playlist's own repair status - a file can be clean and still
+reference something missing, or vice versa.
+
 ## Batch mode
 
 Pass a directory instead of a file and every `.m3u`/`.m3u8`/`.pls`/`.xspf`
@@ -137,9 +155,8 @@ cargo build --release
 ## Status
 
 Early. Handles single M3U/M3U8/PLS/XSPF files passed as a path or via stdin,
-or a whole directory of them at once. Not yet handled: verifying that
-referenced files actually exist on disk, rewriting relative paths when a
-playlist moves.
+or a whole directory of them at once, and can verify referenced files exist
+on disk. Not yet handled: rewriting relative paths when a playlist moves.
 
 ## License
 
