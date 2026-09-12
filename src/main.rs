@@ -128,7 +128,7 @@ fn run_batch(
             }
         };
 
-        let result = match process_content(&raw, &display, opts) {
+        let mut result = match process_content(&raw, &display, opts) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("error: {}: {}", display, e);
@@ -141,8 +141,29 @@ fn run_batch(
             eprintln!("warning: {}: {}", display, warning);
         }
 
+        // The mirrored subdirectory layout keeps each file at the same depth
+        // under its new root, but that root generally sits somewhere else
+        // entirely, so relative paths still need recalculating per file.
+        let out_path = (!check)
+            .then(|| Path::new(output_dir.expect("checked above")).join(relative.with_extension("m3u")));
+
+        if let Some(out_path) = &out_path {
+            let old_dir = full_path.parent().unwrap_or_else(|| Path::new(dir));
+            let new_dir = out_path.parent().unwrap_or_else(|| Path::new(output_dir.expect("checked above")));
+            let (rewritten, rewrite_warnings) =
+                playlist_tidy::rewrite_relative_paths(&result.output, old_dir, new_dir);
+            for warning in &rewrite_warnings {
+                eprintln!("warning: {}: {}", display, warning);
+            }
+            result.output = rewritten;
+            result.warnings.extend(rewrite_warnings);
+        }
+
         if verify {
-            let base_dir = full_path.parent().unwrap_or_else(|| Path::new(dir));
+            let base_dir = out_path
+                .as_deref()
+                .and_then(Path::parent)
+                .unwrap_or_else(|| full_path.parent().unwrap_or_else(|| Path::new(dir)));
             let missing = find_missing_files(&result.output, base_dir);
             if !missing.is_empty() {
                 with_missing_files += 1;
@@ -161,8 +182,7 @@ fn run_batch(
             continue;
         }
 
-        let out_dir = output_dir.expect("checked above");
-        let out_path = Path::new(out_dir).join(relative.with_extension("m3u"));
+        let out_path = out_path.expect("computed above when not checking");
         if let Some(parent) = out_path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
                 eprintln!(
@@ -283,19 +303,41 @@ fn main() -> ExitCode {
     let opts = playlist_tidy::Options { lenient };
     let result = process_content(&raw, &input_path, &opts);
     match result {
-        Ok(result) => {
+        Ok(mut result) => {
             for warning in &result.warnings {
                 eprintln!("warning: {}", warning);
+            }
+
+            // Moving the playlist to a different directory than it's read from
+            // can break its relative paths, since they're resolved against
+            // wherever the file ends up living.
+            if !check && input_path != "-" {
+                if let Some(out_path) = output_path.as_deref() {
+                    let old_dir = Path::new(&input_path).parent().unwrap_or_else(|| Path::new("."));
+                    let new_dir = Path::new(out_path).parent().unwrap_or_else(|| Path::new("."));
+                    let (rewritten, rewrite_warnings) =
+                        playlist_tidy::rewrite_relative_paths(&result.output, old_dir, new_dir);
+                    for warning in &rewrite_warnings {
+                        eprintln!("warning: {}", warning);
+                    }
+                    result.output = rewritten;
+                }
             }
 
             let missing = if verify {
                 let base_dir = if input_path == "-" {
                     PathBuf::from(".")
                 } else {
-                    Path::new(&input_path)
-                        .parent()
-                        .map(Path::to_path_buf)
-                        .unwrap_or_else(|| PathBuf::from("."))
+                    match output_path.as_deref() {
+                        Some(out_path) if !check => Path::new(out_path)
+                            .parent()
+                            .map(Path::to_path_buf)
+                            .unwrap_or_else(|| PathBuf::from(".")),
+                        _ => Path::new(&input_path)
+                            .parent()
+                            .map(Path::to_path_buf)
+                            .unwrap_or_else(|| PathBuf::from(".")),
+                    }
                 };
                 find_missing_files(&result.output, &base_dir)
             } else {

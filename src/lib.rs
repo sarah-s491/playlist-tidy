@@ -2,6 +2,7 @@
 //! so it can be unit tested without touching stdin/stdout or the filesystem.
 
 use std::collections::BTreeMap;
+use std::path::{Component, Path};
 
 /// Behavior switches for `format`. Strict is the default everywhere the
 /// binary constructs this; only `--lenient` sets `lenient` to true.
@@ -211,6 +212,99 @@ fn normalize_path(line: &str) -> Result<String, String> {
         return Err("path uses backslashes instead of forward slashes".to_string());
     }
     Ok(line.to_string())
+}
+
+/// True for paths that don't depend on where the playlist file lives: a
+/// leading `/` (Unix-style absolute) or a drive letter (`C:/...`). By the
+/// time output reaches this point any backslashes have already been
+/// normalized to forward slashes, so `C:\...` doesn't need checking here.
+fn is_absolute_local_path(path: &str) -> bool {
+    if path.starts_with('/') {
+        return true;
+    }
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+/// Resolves `dir` to an absolute, lexically-normalized list of path
+/// components, joining against the process's current directory first if
+/// it's relative. The first element is a root marker (empty string for
+/// `/`, the prefix string for a Windows drive) that later comparisons use
+/// as an anchor - it's never allowed to be popped by a `..`.
+fn absolute_dir_components(dir: &Path) -> Vec<String> {
+    let dir = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(dir)
+    };
+
+    let mut out: Vec<String> = Vec::new();
+    for component in dir.components() {
+        match component {
+            Component::Prefix(p) => out.push(p.as_os_str().to_string_lossy().into_owned()),
+            Component::RootDir => out.push(String::new()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if out.len() > 1 {
+                    out.pop();
+                }
+            }
+            Component::Normal(s) => out.push(s.to_string_lossy().into_owned()),
+        }
+    }
+    out
+}
+
+/// Rewrites every relative local path in a normalized playlist's `output`
+/// so each one still points at the same file after the playlist moves from
+/// `old_dir` to `new_dir`. Absolute paths and URLs are left untouched,
+/// since they don't depend on where the playlist file lives. Resolution is
+/// purely lexical - symlinks aren't followed - which matches how a media
+/// player interprets these paths anyway.
+pub fn rewrite_relative_paths(output: &str, old_dir: &Path, new_dir: &Path) -> (String, Vec<String>) {
+    let old_dir = absolute_dir_components(old_dir);
+    let new_dir = absolute_dir_components(new_dir);
+    if old_dir == new_dir {
+        return (output.to_string(), Vec::new());
+    }
+
+    let mut warnings = Vec::new();
+    let mut result = String::with_capacity(output.len());
+
+    for line in output.lines() {
+        if line.is_empty() || line.starts_with('#') || is_url(line) || is_absolute_local_path(line) {
+            result.push_str(line);
+            result.push('\n');
+            continue;
+        }
+
+        let mut target = old_dir.clone();
+        for part in line.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    if target.len() > 1 {
+                        target.pop();
+                    }
+                }
+                other => target.push(other.to_string()),
+            }
+        }
+
+        let common = target.iter().zip(new_dir.iter()).take_while(|(a, b)| a == b).count();
+        let mut rewritten: Vec<String> =
+            std::iter::repeat("..".to_string()).take(new_dir.len() - common).collect();
+        rewritten.extend(target[common..].iter().cloned());
+        let rewritten = rewritten.join("/");
+
+        if rewritten != line {
+            warnings.push(format!("rewrote relative path '{}' to '{}'", line, rewritten));
+        }
+        result.push_str(&rewritten);
+        result.push('\n');
+    }
+
+    (result, warnings)
 }
 
 fn derive_title(path: &str) -> String {
@@ -913,6 +1007,33 @@ mod tests {
         let input = "<playlist><trackList><track><location>songs/track.mp3</location></track></trackList></playlist>";
         let result = format_xspf(input, &strict()).unwrap();
         assert!(result.output.contains("#EXTINF:-1,track.mp3"));
+    }
+
+    #[test]
+    fn rewrite_relative_paths_leaves_output_unchanged_for_same_directory() {
+        let output = "#EXTM3U\n#EXTINF:5,Title\n../shared/track.mp3\n";
+        let (rewritten, warnings) =
+            rewrite_relative_paths(output, Path::new("library/artist"), Path::new("library/artist"));
+        assert_eq!(rewritten, output);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn rewrite_relative_paths_accounts_for_the_new_directory_depth() {
+        let output = "#EXTM3U\n#EXTINF:5,Title\n../shared/track.mp3\n";
+        let (rewritten, warnings) =
+            rewrite_relative_paths(output, Path::new("library/artist"), Path::new("backup"));
+        assert!(rewritten.contains("../library/shared/track.mp3"));
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn rewrite_relative_paths_skips_absolute_paths_and_urls() {
+        let output = "#EXTM3U\n#EXTINF:5,A\n/music/a.mp3\n#EXTINF:5,B\nhttp://example.com/b.mp3\n";
+        let (rewritten, warnings) =
+            rewrite_relative_paths(output, Path::new("library/artist"), Path::new("backup"));
+        assert_eq!(rewritten, output);
+        assert!(warnings.is_empty());
     }
 
     #[test]

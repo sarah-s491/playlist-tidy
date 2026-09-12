@@ -82,6 +82,30 @@ This only checks presence, not that the file is playable, and it never
 touches the playlist's own repair status - a file can be clean and still
 reference something missing, or vice versa.
 
+## Relative paths when moving a playlist
+
+When `-o` writes the result to a different directory than the input came
+from, any relative (non-URL, non-absolute) path in the playlist is rewritten
+so it still points at the same file from its new location:
+
+```
+$ cat my_library/mix.m3u
+#EXTM3U
+#EXTINF:180,Track
+../shared/track.mp3
+$ playlist-tidy -o backup/mix.m3u my_library/mix.m3u
+warning: rewrote relative path '../shared/track.mp3' to '../my_library/shared/track.mp3'
+```
+
+Absolute paths and URLs are left alone, since they don't depend on the
+playlist's own location. Resolution is lexical only - it doesn't touch the
+filesystem or follow symlinks, so a rewritten path is only as good as the
+directory structure it was computed from. Writing to the same directory the
+input came from, or to stdout, leaves every path untouched. Batch mode does
+the same per file, since mirroring the input's subdirectory layout under a
+different output root doesn't otherwise preserve where relative paths
+outside that layout point.
+
 ## Batch mode
 
 Pass a directory instead of a file and every `.m3u`/`.m3u8`/`.pls`/`.xspf`
@@ -155,8 +179,9 @@ cargo build --release
 ## Status
 
 Early. Handles single M3U/M3U8/PLS/XSPF files passed as a path or via stdin,
-or a whole directory of them at once, and can verify referenced files exist
-on disk. Not yet handled: rewriting relative paths when a playlist moves.
+or a whole directory of them at once, can verify referenced files exist on
+disk, and rewrites relative paths when a playlist moves to a different
+directory.
 
 ## License
 
